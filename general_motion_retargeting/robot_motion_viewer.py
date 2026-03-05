@@ -93,18 +93,21 @@ class RobotMotionViewer:
             # Initialize renderer for video recording
             self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
         
-    def step(self, 
+    def step(self,
             # robot data
-            root_pos, root_rot, dof_pos, 
+            root_pos, root_rot, dof_pos,
             # human data
-            human_motion_data=None, 
+            human_motion_data=None,
             show_human_body_name=False,
             # scale for human point visualization
             human_point_scale=0.1,
-            # human pos offset add for visualization    
+            # human pos offset add for visualization
             human_pos_offset=np.array([0.0, 0.0, 0]),
+            # robot body frame overlay
+            robot_body_frames=None,
+            robot_frame_size=0.15,
             # rate limit
-            rate_limit=True, 
+            rate_limit=True,
             follow_camera=True,
             ):
         """
@@ -129,10 +132,10 @@ class RobotMotionViewer:
             self.viewer.cam.elevation = -10  # 正面视角，轻微向下看
             # self.viewer.cam.azimuth = 180    # 正面朝向机器人
         
-        if human_motion_data is not None:
-            # Clean custom geometry
+        if human_motion_data is not None or robot_body_frames is not None:
             self.viewer.user_scn.ngeom = 0
-            # Draw the task targets for reference
+
+        if human_motion_data is not None:
             for human_body_name, (pos, rot) in human_motion_data.items():
                 draw_frame(
                     pos,
@@ -140,8 +143,18 @@ class RobotMotionViewer:
                     self.viewer,
                     human_point_scale,
                     pos_offset=human_pos_offset,
-                    joint_name=human_body_name if show_human_body_name else None
-                    )
+                    joint_name=human_body_name if show_human_body_name else None,
+                )
+
+        if robot_body_frames is not None:
+            for body_name in robot_body_frames:
+                try:
+                    bid = self.model.body(body_name).id
+                except Exception:
+                    continue
+                pos = self.data.xpos[bid].copy()
+                mat = self.data.xmat[bid].reshape(3, 3).copy()
+                draw_frame(pos, mat, self.viewer, robot_frame_size, joint_name=body_name)
 
         self.viewer.sync()
         if rate_limit is True:

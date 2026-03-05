@@ -167,7 +167,7 @@ def main() -> None:
     parser.add_argument("--solar-url", type=str, default="ws://127.0.0.1:21110")
     parser.add_argument("--minimum-ms", type=int, default=20)
     parser.add_argument("--reset-hold-s", type=float, default=0.5)
-    parser.add_argument("--robot", type=str, default="unitree_g1")
+    parser.add_argument("--robot", type=str, default="unitree_g1_27dof")
     parser.add_argument("--ik-config", type=str, required=True)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--samples", type=int, default=1)

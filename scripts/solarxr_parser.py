@@ -142,10 +142,12 @@ def main() -> None:
     parser.add_argument("--solar-url", type=str, default="ws://127.0.0.1:21110")
     parser.add_argument("--minimum-ms", type=int, default=20)
     parser.add_argument("--reset-hold-s", type=float, default=0.5)
-    parser.add_argument("--robot", type=str, default="unitree_g1")
+    parser.add_argument("--robot", type=str, default="unitree_g1_27dof")
     parser.add_argument("--output", choices=["viewer", "stdout", "none"], default="viewer")
     parser.add_argument("--rate-limit", action="store_true")
     parser.add_argument("--show-human", action="store_true")
+    parser.add_argument("--show-frames", action="store_true")
+    parser.add_argument("--frame-size", type=float, default=0.15)
     parser.add_argument("--print-fps", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -170,8 +172,11 @@ def main() -> None:
     required = set(retarget.human_body_to_task1.keys()) | set(retarget.human_body_to_task2.keys())
 
     viewer = None
+    robot_body_frames = None
     if args.output == "viewer":
         viewer = RobotMotionViewer(robot_type=args.robot)
+        if args.show_frames:
+            robot_body_frames = sorted(set(retarget.ik_match_table1.keys()) | set(retarget.ik_match_table2.keys()))
 
     fps_counter = 0
     fps_start = time.time()
@@ -200,6 +205,8 @@ def main() -> None:
                     root_rot=qpos[3:7],
                     dof_pos=qpos[7:],
                     human_motion_data=retarget.scaled_human_data if args.show_human else None,
+                    robot_body_frames=robot_body_frames,
+                    robot_frame_size=args.frame_size,
                     rate_limit=args.rate_limit,
                     follow_camera=False,
                 )
