@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterable, List
@@ -16,6 +18,57 @@ import mujoco.viewer as mjv
 import numpy as np
 
 from general_motion_retargeting import ROBOT_XML_DICT
+from general_motion_retargeting.params import IK_CONFIG_DICT
+
+
+_SKYBOX = (
+    '<texture type="skybox" builtin="gradient"'
+    ' rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>'
+)
+_FLOOR = (
+    '<texture type="2d" name="groundplane" builtin="checker" mark="edge"'
+    ' rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>\n'
+    '    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>'
+)
+_SCENE_WRAP = """\
+<mujoco model="scene">
+  <include file="{robot_xml}"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-20"/>
+  </visual>
+  <asset>
+    {skybox}
+    {floor}
+  </asset>
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"
+          contype="1" conaffinity="1" condim="3"/>
+  </worldbody>
+</mujoco>
+"""
+
+
+def _load_model(xml_path: Path) -> mj.MjModel:
+    """Load model wrapped in a scene with skybox and floor if not already present."""
+    xml_text = xml_path.read_text(encoding="utf-8")
+    if 'type="skybox"' in xml_text:
+        return mj.MjModel.from_xml_path(str(xml_path))
+    scene_xml = _SCENE_WRAP.format(
+        robot_xml=xml_path.name, skybox=_SKYBOX, floor=_FLOOR
+    )
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".xml", dir=str(xml_path.parent),
+        delete=False, encoding="utf-8"
+    ) as f:
+        f.write(scene_xml)
+        tmp = f.name
+    try:
+        return mj.MjModel.from_xml_path(tmp)
+    finally:
+        os.unlink(tmp)
 
 
 def _unique(seq: Iterable[str]) -> List[str]:
@@ -65,7 +118,7 @@ def _draw_axis(v, pos, mat, label: str, size: float = 0.08):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize G1 body frames from IK config.")
+    parser = argparse.ArgumentParser(description="Visualize robot body frames from an IK config.")
     parser.add_argument(
         "--robot",
         default="unitree_g1",
@@ -73,13 +126,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--ik-config",
-        default=str(Path(__file__).resolve().parents[1] / "general_motion_retargeting" / "ik_configs" / "solarxr_to_g1.json"),
+        default=None,
+        help="Path to IK config JSON. Defaults to the solarxr config for the selected robot.",
     )
     parser.add_argument("--size", type=float, default=0.08)
     args = parser.parse_args()
 
+    if args.ik_config is None:
+        solarxr_configs = IK_CONFIG_DICT.get("solarxr", {})
+        if args.robot not in solarxr_configs:
+            parser.error(f"No default solarxr IK config for '{args.robot}'. Pass --ik-config explicitly.")
+        args.ik_config = str(solarxr_configs[args.robot])
+
     xml_path = ROBOT_XML_DICT[args.robot]
-    model = mj.MjModel.from_xml_path(str(xml_path))
+    model = _load_model(Path(str(xml_path)))
     data = mj.MjData(model)
 
     frames = _load_frame_names(Path(args.ik_config))
