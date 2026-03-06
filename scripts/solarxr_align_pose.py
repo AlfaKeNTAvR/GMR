@@ -150,6 +150,7 @@ def main() -> None:
     parser.add_argument("--output", "-o", default=None, help="Output IK config JSON (default: overwrite --ik-config)")
     parser.add_argument("--frame-size", type=float, default=0.25)
     parser.add_argument("--ignore-limits", action="store_true", help="Ignore joint limits during alignment")
+    parser.add_argument("--load-qpos", default=None, help="JSON file with joint positions to start from")
     args = parser.parse_args()
 
     with open(args.snapshot, "r") as f:
@@ -173,6 +174,15 @@ def main() -> None:
         name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, i)
         if name:
             joint_names.append(name)
+
+    if args.load_qpos:
+        with open(args.load_qpos, "r") as f:
+            saved_qpos = json.load(f)
+        for jname, val in saved_qpos.items():
+            adr = _qpos_adr(model, jname)
+            if adr is not None:
+                data.qpos[adr] = float(val)
+        print(f"[align] Loaded qpos from {args.load_qpos}")
 
     state = _State(joint_names)
 
@@ -321,6 +331,20 @@ def _calibrate_and_save(
         json.dump(ik_cfg, f, indent=4)
         f.write("\n")
     print(f"[align] Wrote rot_offsets → {out}")
+
+    qpos_out = out.with_suffix(".qpos.json")
+    qpos_dict = {}
+    for i in range(model.njnt):
+        if model.jnt_type[i] == mj.mjtJoint.mjJNT_FREE:
+            continue
+        name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, i)
+        if name:
+            adr = int(model.jnt_qposadr[i])
+            qpos_dict[name] = float(data.qpos[adr])
+    with open(qpos_out, "w", encoding="utf-8") as f:
+        json.dump(qpos_dict, f, indent=2)
+        f.write("\n")
+    print(f"[align] Wrote qpos → {qpos_out}")
 
 
 if __name__ == "__main__":

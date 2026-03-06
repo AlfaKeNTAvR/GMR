@@ -43,30 +43,29 @@ def _resolve_solarxr_path(user_path: Optional[str]) -> Path:
         base,
     ]
     for path in candidates:
-        if (path / "solarxr_world.py").exists():
+        if (path / "solarxr_client.py").exists():
             return path
     raise FileNotFoundError(
-        "solarxr_world.py not found. Pass --solarxr-root pointing to XRoboToolkit-PC-Service-Pybind "
+        "solarxr_client.py not found. Pass --solarxr-root pointing to XRoboToolkit-PC-Service-Pybind "
         "or to its examples/solarxr directory."
     )
 
 
-def _import_solarxr_world(solarxr_path: Path):
+def _import_solarxr_client(solarxr_path: Path):
+    sys.path.insert(0, str(solarxr_path))
+    from solarxr_client import SolarXRClient  # type: ignore
+
+    return SolarXRClient
+
+
+def _import_xr_bridge(solarxr_path: Path):
     sys.path.insert(0, str(solarxr_path))
     xr_path = solarxr_path.parent / "xr"
     if xr_path.exists():
         sys.path.insert(0, str(xr_path))
-    try:
-        from solarxr_world import SolarXRWorld  # type: ignore
-    except ModuleNotFoundError as exc:
-        if exc.name == "xrobotoolkit_sdk":
-            raise RuntimeError(
-                "xrobotoolkit_sdk is not installed. Install it inside your conda env from "
-                "XRoboToolkit-PC-Service-Pybind (see README.md)."
-            ) from exc
-        raise
+    from xr_bridge_sender import XRBridgeSender  # type: ignore
 
-    return SolarXRWorld
+    return XRBridgeSender
 
 
 def _pos_xr_to_mj(pos: Position) -> np.ndarray:
@@ -153,14 +152,20 @@ def main() -> None:
     args = parser.parse_args()
 
     solarxr_path = _resolve_solarxr_path(args.solarxr_root)
-    SolarXRWorld = _import_solarxr_world(solarxr_path)
+    SolarXRClient = _import_solarxr_client(solarxr_path)
+    XRBridgeSender = _import_xr_bridge(solarxr_path)
 
-    world = SolarXRWorld(
+    bridge = XRBridgeSender(
         solar_url=args.solar_url,
-        minimum_ms=args.minimum_ms,
         reset_hold_s=args.reset_hold_s,
     )
-    world.start()
+    bridge.start()
+
+    client = SolarXRClient(
+        url=args.solar_url,
+        minimum_ms=args.minimum_ms,
+    )
+    client.start()
 
     retarget = GMR(
         src_human="solarxr",
@@ -185,7 +190,8 @@ def main() -> None:
 
     try:
         while True:
-            bones = world.get_world_bones()
+            bridge.tick()
+            bones = client.get_raw_bones()
             if not bones:
                 time.sleep(0.001)
                 continue
@@ -227,7 +233,8 @@ def main() -> None:
     finally:
         if viewer is not None:
             viewer.close()
-        world.stop()
+        client.stop()
+        bridge.stop()
 
 
 if __name__ == "__main__":
