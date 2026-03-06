@@ -23,37 +23,19 @@ def _resolve_solarxr_path(user_path: Optional[str]) -> Path:
 
     candidates = [base / "examples" / "solarxr", base]
     for path in candidates:
-        if (path / "solarxr_world.py").exists():
+        if (path / "solarxr_client.py").exists():
             return path
     raise FileNotFoundError(
-        "solarxr_world.py not found. Pass --solarxr-root pointing to "
+        "solarxr_client.py not found. Pass --solarxr-root pointing to "
         "XRoboToolkit-PC-Service-Pybind or its examples/solarxr directory."
     )
 
 
-def _import_solarxr_world(solarxr_path: Path):
-    sys.path.insert(0, str(solarxr_path))
-    xr_path = solarxr_path.parent / "xr"
-    if xr_path.exists():
-        sys.path.insert(0, str(xr_path))
-    try:
-        from solarxr_world import SolarXRWorld  # type: ignore
-    except ModuleNotFoundError as exc:
-        if exc.name == "xrobotoolkit_sdk":
-            raise RuntimeError(
-                "xrobotoolkit_sdk is not installed. Install it from "
-                "XRoboToolkit-PC-Service-Pybind (see README.md)."
-            ) from exc
-        raise
-    return SolarXRWorld
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Save a SolarXR world-bones snapshot to JSON.")
+    parser = argparse.ArgumentParser(description="Save a SolarXR bones snapshot to JSON.")
     parser.add_argument("--solarxr-root", type=str, default=None)
     parser.add_argument("--solar-url", type=str, default="ws://127.0.0.1:21110")
     parser.add_argument("--minimum-ms", type=int, default=20)
-    parser.add_argument("--reset-hold-s", type=float, default=0.5)
     parser.add_argument("--timeout-s", type=float, default=10.0)
     parser.add_argument(
         "--output", "-o",
@@ -64,21 +46,18 @@ def main() -> None:
     args = parser.parse_args()
 
     solarxr_path = _resolve_solarxr_path(args.solarxr_root)
-    SolarXRWorld = _import_solarxr_world(solarxr_path)
+    sys.path.insert(0, str(solarxr_path))
+    from solarxr_client import SolarXRClient  # type: ignore
 
-    world = SolarXRWorld(
-        solar_url=args.solar_url,
-        minimum_ms=args.minimum_ms,
-        reset_hold_s=args.reset_hold_s,
-    )
-    world.start()
+    client = SolarXRClient(url=args.solar_url, minimum_ms=args.minimum_ms)
+    client.start()
 
     print("[snapshot] Waiting for bones...", flush=True)
     start = time.time()
     bones = None
     try:
         while True:
-            bones = world.get_world_bones()
+            bones = client.get_raw_bones()
             if bones:
                 break
             if time.time() - start > args.timeout_s:
@@ -86,10 +65,10 @@ def main() -> None:
                 return
             time.sleep(0.01)
     finally:
-        world.stop()
+        client.stop()
 
     out_path = Path(args.output)
-    # world bones values may contain non-serialisable types; coerce to plain lists
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot = {
         name: {k: list(v) if hasattr(v, "__iter__") else v for k, v in entry.items()}
         for name, entry in bones.items()
