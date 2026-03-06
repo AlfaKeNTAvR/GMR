@@ -75,7 +75,11 @@ def _pos_xr_to_mj(pos: Position) -> np.ndarray:
 def _quat_xr_to_mj_wxyz(quat_xyzw: Optional[Tuple[float, float, float, float]]) -> np.ndarray:
     if not quat_xyzw:
         return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
-    rot_xr = R.from_quat(quat_xyzw)  # xyzw
+    q = np.asarray(quat_xyzw, dtype=float)
+    norm = np.linalg.norm(q)
+    if not np.isfinite(norm) or norm < 1e-6:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    rot_xr = R.from_quat(q / norm)  # xyzw, pre-normalized
     rot_mj = R.from_matrix(XR_TO_MJ @ rot_xr.as_matrix() @ XR_TO_MJ.T)
     q_xyzw = rot_mj.as_quat()
     return np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]], dtype=float)
