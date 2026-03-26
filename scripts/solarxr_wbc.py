@@ -10,7 +10,6 @@ controller via Zenoh.
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from pathlib import Path
@@ -72,8 +71,6 @@ ARM_JOINT_INDICES: Dict[str, int] = {
 # MuJoCo body names for torso angle computation
 PELVIS_BODY = "pelvis_link"
 CHEST_BODY = "spine_pitch_link"
-LEFT_FOOT_BODY = "left_ankle_roll_link"
-RIGHT_FOOT_BODY = "right_ankle_roll_link"
 
 HEIGHT_INDEX = 2  # qpos[2] = pelvis Z
 
@@ -100,13 +97,10 @@ def _import_solarxr_client(solarxr_path: Path):
     return SolarXRClient
 
 
-def _import_xr_bridge(solarxr_path: Path):
+def _import_slimevr_bridge(solarxr_path: Path):
     sys.path.insert(0, str(solarxr_path))
-    xr_path = solarxr_path.parent / "xr"
-    if xr_path.exists():
-        sys.path.insert(0, str(xr_path))
-    from xr_bridge_sender import XRBridgeSender  # type: ignore
-    return XRBridgeSender
+    from slimevr_bridge_sender import SlimeVRBridgeSender  # type: ignore
+    return SlimeVRBridgeSender
 
 
 def _pos_xr_to_mj(pos: Position) -> np.ndarray:
@@ -180,13 +174,12 @@ def compute_torso_angle(
     data: mj.MjData,
     pelvis_id: int,
     chest_id: int,
-    left_foot_id: int,
-    right_foot_id: int,
 ) -> Tuple[float, float, float]:
-    """Compute torso roll/pitch/yaw in the control frame.
+    """Compute torso roll/pitch/yaw.
 
-    Control frame: origin at pelvis, Z = world up, X = forward
-    (yaw-aligned to average foot heading).
+    Roll and pitch are chest orientation relative to the control frame
+    (z-up, yaw-aligned to pelvis heading). Yaw is the pelvis heading
+    in world frame.
     """
     # Body quaternions from MuJoCo (wxyz format) — copy to avoid aliasing
     pelvis_q = np.array(data.xquat[pelvis_id], dtype=float)
@@ -208,17 +201,17 @@ def compute_torso_angle(
     pelvis_rot = R.from_quat(pelvis_xyzw)
     chest_rot = R.from_quat(chest_xyzw)
 
-    # Pelvis yaw → control frame heading
-    control_yaw = pelvis_rot.as_euler("ZYX")[0]
-    control_rot = R.from_euler("Z", control_yaw)
+    # Pelvis yaw in world frame
+    world_yaw = pelvis_rot.as_euler("ZYX")[0]
 
-    # Chest relative to control frame
+    # Chest relative to control frame (z-up, yaw-aligned to pelvis)
+    control_rot = R.from_euler("Z", world_yaw)
     relative_rot = control_rot.inv() * chest_rot
 
-    # Decompose into roll (X), pitch (Y), yaw (Z) — extrinsic XYZ
-    roll, pitch, yaw = relative_rot.as_euler("xyz")
+    # Roll/pitch from relative rotation, yaw from pelvis world heading
+    roll, pitch, _ = relative_rot.as_euler("xyz")
 
-    return float(roll), float(pitch), float(yaw)
+    return float(roll), float(pitch), float(world_yaw)
 
 
 # ---------------------------------------------------------------------------
@@ -233,10 +226,11 @@ def main() -> None:
     parser.add_argument("--solarxr-root", type=str, default=None)
     parser.add_argument("--solar-url", type=str, default="ws://127.0.0.1:21110")
     parser.add_argument("--minimum-ms", type=int, default=20)
-    parser.add_argument("--reset-hold-s", type=float, default=0.5)
     parser.add_argument("--robot", type=str, default="persona_it1")
     parser.add_argument("--port", type=int, default=4202,
                         help="Zenoh TCP port for control_rs")
+    parser.add_argument("--teleop-port", type=int, default=9876,
+                        help="UDP port for teleop_rs Quest 3 data")
     parser.add_argument("--viewer", action="store_true",
                         help="Show MuJoCo viewer alongside WBC output")
     parser.add_argument("--print-fps", action="store_true")
@@ -251,13 +245,17 @@ def main() -> None:
     # --- SolarXR setup ---
     solarxr_path = _resolve_solarxr_path(args.solarxr_root)
     SolarXRClient = _import_solarxr_client(solarxr_path)
-    XRBridgeSender = _import_xr_bridge(solarxr_path)
+    SlimeVRBridgeSender = _import_slimevr_bridge(solarxr_path)
 
-    bridge = XRBridgeSender(
-        solar_url=args.solar_url,
-        reset_hold_s=args.reset_hold_s,
-    )
-    bridge.start()
+    # teleop_rs Quest 3 data → SlimeVR bridge (HMD + controllers)
+    from teleop_receiver import TeleopReceiver
+
+    teleop = TeleopReceiver(port=args.teleop_port)
+    teleop.start()
+
+    slimevr = SlimeVRBridgeSender()
+    slimevr.connect()
+    print(f"[solarxr_wbc] SlimeVR bridge connected, teleop on :{args.teleop_port}")
 
     client = SolarXRClient(
         url=args.solar_url,
@@ -280,8 +278,6 @@ def main() -> None:
     model = retarget.model
     pelvis_id = _body_id(model, PELVIS_BODY)
     chest_id = _body_id(model, CHEST_BODY)
-    left_foot_id = _body_id(model, LEFT_FOOT_BODY)
-    right_foot_id = _body_id(model, RIGHT_FOOT_BODY)
 
     # --- WBC controller ---
     controller = ControllerApi(args.port)
@@ -297,30 +293,53 @@ def main() -> None:
     if args.viewer:
         viewer = RobotMotionViewer(robot_type=args.robot)
 
-    # --- Controller input (Quest 3 buttons/joysticks) ---
-    import xrobotoolkit_sdk as xrt
-
     FORWARD_MAX = 1.0  # m/s
     LATERAL_MAX = 0.5  # m/s
     ANGULAR_MAX = 1.5  # rad/s
     JOYSTICK_DEADZONE = 0.1
+    RESET_HOLD_S = 0.5  # hold B button this long to reset SlimeVR
+    RECENTER_DELAY_S = 1.0  # wait for tracking to settle after recenter
 
     mode = "walk"  # current policy: "wbc" or "walk"
     a_button_prev = False
-
+    b_button_since: Optional[float] = None  # timestamp when B was first pressed
+    b_reset_fired = False  # prevent repeat resets while held
+    recenter_at: Optional[float] = None  # scheduled reset time after recenter
     fps_counter = 0
     fps_start = time.time()
     fps_interval = 2.0
     last_missing_report = 0.0
 
-    print("[solarxr_wbc] Streaming. A button toggles WBC/walk. Ctrl-C to stop.")
+    print("[solarxr_wbc] A=toggle WBC/walk, Reset View=reset SlimeVR, B(hold)=reset fallback. Ctrl-C to stop.")
 
     try:
         while True:
-            bridge.tick()
+            snap = teleop.latest()
+
+            # --- Forward Quest 3 poses to SlimeVR ---
+            if snap.head:
+                x, y, z, qw, qx, qy, qz = snap.head
+                slimevr.send_hmd((x, y, z), (qx, qy, qz, qw))
+            if snap.controller_left:
+                c = snap.controller_left
+                # 180° Y correction: grip frame → SlimeVR convention
+                qw, qx, qy, qz = c.orientation
+                slimevr.send_left_controller(
+                    c.position, (-qx, qy, -qz, qw)
+                )
+            if snap.controller_right:
+                c = snap.controller_right
+                qw, qx, qy, qz = c.orientation
+                slimevr.send_right_controller(
+                    c.position, (-qx, qy, -qz, qw)
+                )
 
             # --- A button: toggle WBC <-> walk ---
-            a_button = bool(xrt.get_A_button())
+            a_button = (
+                snap.controller_right.buttons[0]
+                if snap.controller_right
+                else False
+            )
             if a_button and not a_button_prev:
                 if mode == "wbc":
                     mode = "walk"
@@ -332,29 +351,61 @@ def main() -> None:
                     controller.policy("wbc")
             a_button_prev = a_button
 
+            # --- Reset SlimeVR skeleton ---
+            # Trigger 1: headset "reset view" — schedule reset after delay
+            if snap.recenter:
+                recenter_at = time.time() + RECENTER_DELAY_S
+                print(f"[solarxr_wbc] Recenter detected — resetting SlimeVR in {RECENTER_DELAY_S}s")
+            if recenter_at is not None and time.time() >= recenter_at:
+                print("[solarxr_wbc] Resetting SlimeVR skeleton (recenter)")
+                client.reset_full()
+                recenter_at = None
+
+            # Trigger 2: B button hold (fallback when controllers are active)
+            b_button = (
+                snap.controller_right.buttons[1]
+                if snap.controller_right
+                else False
+            )
+            if b_button:
+                now = time.time()
+                if b_button_since is None:
+                    b_button_since = now
+                elif not b_reset_fired and (now - b_button_since) >= RESET_HOLD_S:
+                    print("[solarxr_wbc] Resetting SlimeVR skeleton (B button)")
+                    client.reset_full()
+                    b_reset_fired = True
+            else:
+                b_button_since = None
+                b_reset_fired = False
+
             # --- Walk mode: joystick control ---
             if mode == "walk":
-                # Left joystick: forward/back (Y) and lateral (X)
-                left_axis = xrt.get_left_axis()
-                # Right joystick: yaw (X)
-                right_axis = xrt.get_right_axis()
+                left_stick = (
+                    snap.controller_left.thumbstick
+                    if snap.controller_left
+                    else (0.0, 0.0)
+                )
+                right_stick = (
+                    snap.controller_right.thumbstick
+                    if snap.controller_right
+                    else (0.0, 0.0)
+                )
 
-                rx = float(left_axis[0]) if left_axis else 0.0
-                ry = float(left_axis[1]) if left_axis else 0.0
-                lx = float(right_axis[0]) if right_axis else 0.0
+                lx, ly = left_stick
+                rx, _ = right_stick
 
-                # Apply deadzone
-                if abs(rx) < JOYSTICK_DEADZONE:
-                    rx = 0.0
-                if abs(ry) < JOYSTICK_DEADZONE:
-                    ry = 0.0
                 if abs(lx) < JOYSTICK_DEADZONE:
                     lx = 0.0
+                if abs(ly) < JOYSTICK_DEADZONE:
+                    ly = 0.0
+                if abs(rx) < JOYSTICK_DEADZONE:
+                    rx = 0.0
 
                 controller.gait_velocity(
-                    forward=ry * FORWARD_MAX,
-                    lateral=-rx * LATERAL_MAX,
-                    angular=-lx * ANGULAR_MAX,
+                    forward=ly * FORWARD_MAX,
+                    lateral=-lx * LATERAL_MAX,
+                    angular=-rx * ANGULAR_MAX,
                 )
                 time.sleep(0.02)
                 continue
@@ -391,7 +442,7 @@ def main() -> None:
 
             # --- Compute and send torso angle ---
             roll, pitch, yaw = compute_torso_angle(
-                model, mj_data, pelvis_id, chest_id, left_foot_id, right_foot_id
+                model, mj_data, pelvis_id, chest_id
             )
             controller.torso_angle(roll=roll, pitch=pitch, yaw=yaw)
 
@@ -422,7 +473,8 @@ def main() -> None:
         if viewer is not None:
             viewer.close()
         client.stop()
-        bridge.stop()
+        teleop.stop()
+        slimevr.close()
 
 
 if __name__ == "__main__":
