@@ -87,7 +87,17 @@ class TeleopReceiver:
 
     def latest(self) -> TrackingSnapshot:
         with self._lock:
-            return self._latest
+            snap = self._latest
+            if snap.recenter:
+                self._latest = TrackingSnapshot(
+                    sequence=snap.sequence,
+                    timestamp_ns=snap.timestamp_ns,
+                    head=snap.head,
+                    controller_left=snap.controller_left,
+                    controller_right=snap.controller_right,
+                    recenter=False,
+                )
+            return snap
 
     # ------------------------------------------------------------------
     # Receive loop
@@ -105,6 +115,15 @@ class TeleopReceiver:
                 snap = self._parse(data)
                 if snap is not None:
                     with self._lock:
+                        if self._latest.recenter and not snap.recenter:
+                            snap = TrackingSnapshot(
+                                sequence=snap.sequence,
+                                timestamp_ns=snap.timestamp_ns,
+                                head=snap.head,
+                                controller_left=snap.controller_left,
+                                controller_right=snap.controller_right,
+                                recenter=True,
+                            )
                         self._latest = snap
             except socket.timeout:
                 continue

@@ -233,7 +233,6 @@ def main() -> None:
                         help="UDP port for teleop_rs Quest 3 data")
     parser.add_argument("--viewer", action="store_true",
                         help="Show MuJoCo viewer alongside WBC output")
-    parser.add_argument("--print-fps", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -282,10 +281,7 @@ def main() -> None:
     # --- WBC controller ---
     controller = ControllerApi(args.port)
     print(f"[solarxr_wbc] Connected to control_rs on port {args.port}")
-    print("[solarxr_wbc] Going to home pose...")
-    controller.pose("home")
-    time.sleep(3.0)
-    print("[solarxr_wbc] Transitioning to walk policy...")
+    print("[solarxr_wbc] Starting walk policy...")
     controller.policy("walk")
 
     # --- Optional viewer ---
@@ -297,20 +293,11 @@ def main() -> None:
     LATERAL_MAX = 0.5  # m/s
     ANGULAR_MAX = 1.5  # rad/s
     JOYSTICK_DEADZONE = 0.1
-    RESET_HOLD_S = 0.5  # hold B button this long to reset SlimeVR
-    RECENTER_DELAY_S = 1.0  # wait for tracking to settle after recenter
-
     mode = "walk"  # current policy: "wbc" or "walk"
     a_button_prev = False
-    b_button_since: Optional[float] = None  # timestamp when B was first pressed
-    b_reset_fired = False  # prevent repeat resets while held
-    recenter_at: Optional[float] = None  # scheduled reset time after recenter
-    fps_counter = 0
-    fps_start = time.time()
-    fps_interval = 2.0
     last_missing_report = 0.0
 
-    print("[solarxr_wbc] A=toggle WBC/walk, Reset View=reset SlimeVR, B(hold)=reset fallback. Ctrl-C to stop.")
+    print("[solarxr_wbc] A=toggle WBC/walk, Reset View=reset SlimeVR. Ctrl-C to stop.")
 
     try:
         while True:
@@ -352,32 +339,12 @@ def main() -> None:
             a_button_prev = a_button
 
             # --- Reset SlimeVR skeleton ---
-            # Trigger 1: headset "reset view" — schedule reset after delay
+            # Trigger 1: headset "reset view" — reset immediately (OpenXR
+            # already waits for the origin change before sending the flag)
             if snap.recenter:
-                recenter_at = time.time() + RECENTER_DELAY_S
-                print(f"[solarxr_wbc] Recenter detected — resetting SlimeVR in {RECENTER_DELAY_S}s")
-            if recenter_at is not None and time.time() >= recenter_at:
                 print("[solarxr_wbc] Resetting SlimeVR skeleton (recenter)")
                 client.reset_full()
-                recenter_at = None
 
-            # Trigger 2: B button hold (fallback when controllers are active)
-            b_button = (
-                snap.controller_right.buttons[1]
-                if snap.controller_right
-                else False
-            )
-            if b_button:
-                now = time.time()
-                if b_button_since is None:
-                    b_button_since = now
-                elif not b_reset_fired and (now - b_button_since) >= RESET_HOLD_S:
-                    print("[solarxr_wbc] Resetting SlimeVR skeleton (B button)")
-                    client.reset_full()
-                    b_reset_fired = True
-            else:
-                b_button_since = None
-                b_reset_fired = False
 
             # --- Walk mode: joystick control ---
             if mode == "walk":
@@ -456,15 +423,6 @@ def main() -> None:
                     follow_camera=False,
                 )
 
-            # --- FPS ---
-            if args.print_fps:
-                fps_counter += 1
-                now = time.time()
-                if now - fps_start >= fps_interval:
-                    fps = fps_counter / (now - fps_start)
-                    print(f"[solarxr_wbc] fps={fps:.2f}")
-                    fps_counter = 0
-                    fps_start = now
 
     except KeyboardInterrupt:
         print("\n[solarxr_wbc] Stopping...")
