@@ -1,0 +1,40 @@
+[project]
+name = "general-motion-retargeting"
+version = "0.2.0"
+description = "General Motion Retargeting (GMR) for Humanoid Robots"
+requires-python = ">=3.12"
+license = "MIT"
+readme = "README.md"
+dependencies = [
+    "loop_rate_limiters",
+    "mink",
+    "mujoco",
+    "numpy",
+    "scipy",
+    "qpsolvers[proxqp]",
+    "rich",
+    "tqdm",
+    "opencv-python",
+    "natsort",
+    "psutil",
+    "smplx @ git+https://github.com/vchoutas/smplx",
+    "protobuf",
+    "redis[hiredis]",
+    "imageio[ffmpeg]",
+    "persona-proto",
+    "eclipse-zenoh",
+    "loguru",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+constraint-dependencies = ["proxsuite<0.7.2.post1"]
+
+[tool.uv.sources]
+persona-proto = { path = "../persona/interfaces/persona_proto_py" }
+
+[tool.setuptools]
+packages = ["general_motion_retargeting"]

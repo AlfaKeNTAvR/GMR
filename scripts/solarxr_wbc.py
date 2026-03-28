@@ -38,6 +38,66 @@ XR_TO_MJ = np.array(
     dtype=float,
 )
 
+# ---------------------------------------------------------------------------
+# IOBT direct mode: Quest 3 body joint index → GMR bone name
+# ---------------------------------------------------------------------------
+
+IOBT_TO_BONE: Dict[int, str] = {
+    0: "hip",               # Hips
+    1: "chest",             # SpineChest
+    5: "left_upper_arm",    # ShoulderLeft
+    6: "left_lower_arm",    # ElbowLeft
+    7: "left_hand",         # WristLeft
+    9: "right_upper_arm",   # ShoulderRight
+    10: "right_lower_arm",  # ElbowRight
+    11: "right_hand",       # WristRight
+    17: "left_hip",         # UpperLegLeft
+    18: "left_lower_leg",   # LowerLegLeft
+    19: "left_foot_tail",   # AnkleLeft
+    21: "right_hip",        # UpperLegRight
+    22: "right_lower_leg",  # LowerLegRight
+    23: "right_foot_tail",  # AnkleRight
+}
+
+
+def _iobt_to_bones(
+    body: List[Tuple[float, ...]],
+    reference: Optional[Dict[str, np.ndarray]] = None,
+) -> Dict[str, Dict[str, object]]:
+    """Convert IOBT upper_body poses to SolarXR-compatible bones dict.
+
+    IOBT pose layout: (x, y, z, qw, qx, qy, qz)
+    SolarXR bones expect: {"head": (x,y,z), "rot": (qx,qy,qz,qw)}
+
+    If *reference* is provided (from neutral-pose calibration), rotations are
+    expressed relative to the reference: delta = current * inv(reference).
+    """
+    bones: Dict[str, Dict[str, object]] = {}
+    for idx, name in IOBT_TO_BONE.items():
+        pose = body[idx]
+        pos = (pose[0], pose[1], pose[2])
+        rot_xyzw = np.array([pose[4], pose[5], pose[6], pose[3]])  # wxyz → xyzw
+
+        if reference is not None and name in reference:
+            cur = R.from_quat(rot_xyzw)
+            ref = R.from_quat(reference[name])
+            rot_xyzw = (cur * ref.inv()).as_quat()
+
+        bones[name] = {"head": pos, "rot": tuple(rot_xyzw)}
+    return bones
+
+
+def _iobt_capture_reference(
+    body: List[Tuple[float, ...]],
+) -> Dict[str, np.ndarray]:
+    """Capture current IOBT rotations as the neutral-pose reference (xyzw)."""
+    ref: Dict[str, np.ndarray] = {}
+    for idx, name in IOBT_TO_BONE.items():
+        pose = body[idx]
+        ref[name] = np.array([pose[4], pose[5], pose[6], pose[3]])
+    return ref
+
+
 ALIAS_MAP: Dict[str, List[str]] = {
     "hip": ["hip", "waist"],
     "chest": ["chest", "upper_chest"],
@@ -232,8 +292,10 @@ def main() -> None:
     parser.add_argument("--teleop-port", type=int, default=9876,
                         help="UDP port for teleop_rs Quest 3 data")
     parser.add_argument("--viewer", action="store_true",
-                        help="Show MuJoCo viewer alongside WBC output")
+                        help="Show MuJoCo viewer window")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--iobt", action="store_true",
+                        help="Use Quest 3 IOBT body tracking directly (skip SolarXR/SlimeVR)")
     args = parser.parse_args()
 
     # --- Import ControllerApi from control_rs ---
@@ -241,26 +303,31 @@ def main() -> None:
     sys.path.insert(0, str(control_rs_scripts))
     from utils.controller import ControllerApi  # type: ignore
 
-    # --- SolarXR setup ---
-    solarxr_path = _resolve_solarxr_path(args.solarxr_root)
-    SolarXRClient = _import_solarxr_client(solarxr_path)
-    SlimeVRBridgeSender = _import_slimevr_bridge(solarxr_path)
-
-    # teleop_rs Quest 3 data → SlimeVR bridge (HMD + controllers)
+    # --- Teleop receiver (always needed for head/controllers) ---
     from teleop_receiver import TeleopReceiver
 
     teleop = TeleopReceiver(port=args.teleop_port)
     teleop.start()
 
-    slimevr = SlimeVRBridgeSender()
-    slimevr.connect()
-    print(f"[solarxr_wbc] SlimeVR bridge connected, teleop on :{args.teleop_port}")
+    # --- SolarXR / SlimeVR setup (skipped in IOBT mode) ---
+    client = None
+    slimevr = None
+    if not args.iobt:
+        solarxr_path = _resolve_solarxr_path(args.solarxr_root)
+        SolarXRClient = _import_solarxr_client(solarxr_path)
+        SlimeVRBridgeSender = _import_slimevr_bridge(solarxr_path)
 
-    client = SolarXRClient(
-        url=args.solar_url,
-        minimum_ms=args.minimum_ms,
-    )
-    client.start()
+        slimevr = SlimeVRBridgeSender()
+        slimevr.connect()
+        print(f"[solarxr_wbc] SlimeVR bridge connected, teleop on :{args.teleop_port}")
+
+        client = SolarXRClient(
+            url=args.solar_url,
+            minimum_ms=args.minimum_ms,
+        )
+        client.start()
+    else:
+        print(f"[solarxr_wbc] IOBT direct mode, teleop on :{args.teleop_port}")
 
     # --- GMR retargeter ---
     retarget = GMR(
@@ -296,30 +363,35 @@ def main() -> None:
     mode = "walk"  # current policy: "wbc" or "walk"
     a_button_prev = False
     last_missing_report = 0.0
+    iobt_debug_frames = 3  # print first 3 frames when --verbose --iobt
+    iobt_reference: Optional[Dict[str, np.ndarray]] = None
 
+    if args.iobt:
+        print("[solarxr_wbc] Stand in neutral pose (arms down), then press Reset View on Quest 3.")
     print("[solarxr_wbc] A=toggle WBC/walk, Reset View=reset SlimeVR. Ctrl-C to stop.")
 
     try:
         while True:
             snap = teleop.latest()
 
-            # --- Forward Quest 3 poses to SlimeVR ---
-            if snap.head:
-                x, y, z, qw, qx, qy, qz = snap.head
-                slimevr.send_hmd((x, y, z), (qx, qy, qz, qw))
-            if snap.controller_left:
-                c = snap.controller_left
-                # 180° Y correction: grip frame → SlimeVR convention
-                qw, qx, qy, qz = c.orientation
-                slimevr.send_left_controller(
-                    c.position, (-qx, qy, -qz, qw)
-                )
-            if snap.controller_right:
-                c = snap.controller_right
-                qw, qx, qy, qz = c.orientation
-                slimevr.send_right_controller(
-                    c.position, (-qx, qy, -qz, qw)
-                )
+            # --- Forward Quest 3 poses to SlimeVR (SolarXR mode only) ---
+            if slimevr is not None:
+                if snap.head:
+                    x, y, z, qw, qx, qy, qz = snap.head
+                    slimevr.send_hmd((x, y, z), (qx, qy, qz, qw))
+                if snap.controller_left:
+                    c = snap.controller_left
+                    # 180° Y correction: grip frame → SlimeVR convention
+                    qw, qx, qy, qz = c.orientation
+                    slimevr.send_left_controller(
+                        c.position, (-qx, qy, -qz, qw)
+                    )
+                if snap.controller_right:
+                    c = snap.controller_right
+                    qw, qx, qy, qz = c.orientation
+                    slimevr.send_right_controller(
+                        c.position, (-qx, qy, -qz, qw)
+                    )
 
             # --- A button: toggle WBC <-> walk ---
             a_button = (
@@ -338,12 +410,15 @@ def main() -> None:
                     controller.policy("wbc")
             a_button_prev = a_button
 
-            # --- Reset SlimeVR skeleton ---
-            # Trigger 1: headset "reset view" — reset immediately (OpenXR
-            # already waits for the origin change before sending the flag)
+            # --- Recenter / calibrate ---
             if snap.recenter:
-                print("[solarxr_wbc] Resetting SlimeVR skeleton (recenter)")
-                client.reset_full()
+                if args.iobt and snap.upper_body:
+                    iobt_reference = _iobt_capture_reference(snap.upper_body)
+                    iobt_debug_frames = 3
+                    print("[iobt] Neutral pose captured — calibration done.")
+                if client is not None:
+                    print("[solarxr_wbc] Resetting SlimeVR skeleton (recenter)")
+                    client.reset_full()
 
 
             # --- Walk mode: joystick control ---
@@ -378,10 +453,27 @@ def main() -> None:
                 continue
 
             # --- WBC mode: retargeting ---
-            bones = client.get_raw_bones()
-            if not bones:
-                time.sleep(0.001)
-                continue
+            if args.iobt:
+                if not snap.upper_body:
+                    time.sleep(0.001)
+                    continue
+                if iobt_reference is None:
+                    time.sleep(0.01)
+                    continue
+                bones = _iobt_to_bones(snap.upper_body, reference=iobt_reference)
+                if args.verbose and iobt_debug_frames > 0:
+                    iobt_debug_frames -= 1
+                    print(f"[iobt] frame {3 - iobt_debug_frames}/3 — calibrated bone data:")
+                    for name in sorted(bones.keys()):
+                        b = bones[name]
+                        p = b["head"]
+                        r = b["rot"]
+                        print(f"  {name:20s}  pos=({p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f})  rot_xyzw=({r[0]:+.4f},{r[1]:+.4f},{r[2]:+.4f},{r[3]:+.4f})")
+            else:
+                bones = client.get_raw_bones()
+                if not bones:
+                    time.sleep(0.001)
+                    continue
 
             human_data, missing = _build_human_data(bones, required)
             if missing:
@@ -430,9 +522,11 @@ def main() -> None:
         controller.stop()
         if viewer is not None:
             viewer.close()
-        client.stop()
+        if client is not None:
+            client.stop()
         teleop.stop()
-        slimevr.close()
+        if slimevr is not None:
+            slimevr.close()
 
 
 if __name__ == "__main__":

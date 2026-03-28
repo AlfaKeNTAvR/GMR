@@ -21,7 +21,7 @@ import socket
 import struct
 import threading
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -47,6 +47,7 @@ class TrackingSnapshot:
     head: Optional[Tuple[float, ...]] = None  # (x, y, z, qw, qx, qy, qz)
     controller_left: Optional[CompactController] = None
     controller_right: Optional[CompactController] = None
+    upper_body: Optional[List[Tuple[float, ...]]] = None  # 25 × (x, y, z, qw, qx, qy, qz)
     recenter: bool = False  # True on the frame when the user reset the view
 
 
@@ -95,6 +96,7 @@ class TeleopReceiver:
                     head=snap.head,
                     controller_left=snap.controller_left,
                     controller_right=snap.controller_right,
+                    upper_body=snap.upper_body,
                     recenter=False,
                 )
             return snap
@@ -122,6 +124,7 @@ class TeleopReceiver:
                                 head=snap.head,
                                 controller_left=snap.controller_left,
                                 controller_right=snap.controller_right,
+                                upper_body=snap.upper_body,
                                 recenter=True,
                             )
                         self._latest = snap
@@ -159,8 +162,8 @@ class TeleopReceiver:
         ctrl_l, off = _parse_option_controller(data, off)
         # 5. controller_right: Option<CompactController>
         ctrl_r, off = _parse_option_controller(data, off)
-        # 6. upper_body: Option<[[f32;7];25]> — skip
-        off = _skip_option(data, off, _BODY_SIZE)
+        # 6. upper_body: Option<[[f32;7];25]>
+        body, off = _parse_option_body(data, off)
         # 7. recenter: bool
         recenter = bool(data[off]) if off < len(data) else False
 
@@ -170,6 +173,7 @@ class TeleopReceiver:
             head=head,
             controller_left=ctrl_l,
             controller_right=ctrl_r,
+            upper_body=body,
             recenter=recenter,
         )
 
@@ -199,6 +203,22 @@ def _parse_option_pose(
     values = struct.unpack_from("<7f", data, off)
     off += _POSE_SIZE
     return values, off
+
+
+def _parse_option_body(
+    data: bytes, off: int
+) -> Tuple[Optional[List[Tuple[float, ...]]], int]:
+    """Parse Option<[[f32; 7]; 25]> → list of 25 (x, y, z, qw, qx, qy, qz) or None."""
+    tag = data[off]
+    off += 1
+    if not tag:
+        return None, off
+    joints = []
+    for _ in range(25):
+        values = struct.unpack_from("<7f", data, off)
+        off += _POSE_SIZE
+        joints.append(values)
+    return joints, off
 
 
 def _parse_option_controller(
