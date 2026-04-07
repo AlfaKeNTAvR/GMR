@@ -78,6 +78,9 @@ def _iobt_to_bones(
         pos = (pose[0], pose[1], pose[2])
         rot_xyzw = np.array([pose[4], pose[5], pose[6], pose[3]])  # wxyz → xyzw
 
+        if np.linalg.norm(rot_xyzw) < 1e-6:
+            continue  # No tracking data yet for this joint
+
         if reference is not None and name in reference:
             cur = R.from_quat(rot_xyzw)
             ref = R.from_quat(reference[name])
@@ -94,7 +97,10 @@ def _iobt_capture_reference(
     ref: Dict[str, np.ndarray] = {}
     for idx, name in IOBT_TO_BONE.items():
         pose = body[idx]
-        ref[name] = np.array([pose[4], pose[5], pose[6], pose[3]])
+        quat = np.array([pose[4], pose[5], pose[6], pose[3]])
+        if np.linalg.norm(quat) < 1e-6:
+            continue  # No tracking data for this joint
+        ref[name] = quat
     return ref
 
 
@@ -493,7 +499,7 @@ def main() -> None:
             arm_targets = {
                 name: float(qpos[idx]) for name, idx in ARM_JOINT_INDICES.items()
             }
-            controller.joint_state(arm_targets)
+            controller.joint_states(arm_targets)
 
             # --- Extract height ---
             height = float(qpos[HEIGHT_INDEX])
