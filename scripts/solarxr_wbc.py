@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SolarXR -> GMR retargeting -> WBC (control_rs) bridge for IT1.
+SolarXR -> GMR retargeting -> WBC (pcf) bridge for IT1.
 
 Reads mocopi tracker data from SolarXR, runs GMR inverse kinematics,
 and publishes arm joints, torso angle, and height to the whole-body
@@ -294,7 +294,7 @@ def main() -> None:
     parser.add_argument("--minimum-ms", type=int, default=20)
     parser.add_argument("--robot", type=str, default="persona_it1")
     parser.add_argument("--port", type=int, default=4202,
-                        help="Zenoh TCP port for control_rs")
+                        help="Zenoh TCP port for pcf")
     parser.add_argument("--teleop-port", type=int, default=9876,
                         help="UDP port for teleop_rs Quest 3 data")
     parser.add_argument("--viewer", action="store_true",
@@ -304,9 +304,9 @@ def main() -> None:
                         help="Use Quest 3 IOBT body tracking directly (skip SolarXR/SlimeVR)")
     args = parser.parse_args()
 
-    # --- Import ControllerApi from control_rs ---
-    control_rs_scripts = Path(__file__).resolve().parents[1].parent / "control_rs" / "scripts"
-    sys.path.insert(0, str(control_rs_scripts))
+    # --- Import ControllerApi from pcf ---
+    pcf_scripts = Path(__file__).resolve().parents[1].parent / "persona" / "locomotion" / "pcf" / "scripts"
+    sys.path.insert(0, str(pcf_scripts))
     from utils.controller import ControllerApi  # type: ignore
 
     # --- Teleop receiver (always needed for head/controllers) ---
@@ -353,7 +353,7 @@ def main() -> None:
 
     # --- WBC controller ---
     controller = ControllerApi(args.port)
-    print(f"[solarxr_wbc] Connected to control_rs on port {args.port}")
+    print(f"[solarxr_wbc] Connected to pcf on port {args.port}")
     print("[solarxr_wbc] Starting walk policy...")
     controller.policy("walk")
 
