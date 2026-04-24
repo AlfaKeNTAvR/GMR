@@ -10,6 +10,7 @@ controller via Zenoh.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -78,12 +79,19 @@ def _iobt_to_bones(
         pos = (pose[0], pose[1], pose[2])
         rot_xyzw = np.array([pose[4], pose[5], pose[6], pose[3]])  # wxyz → xyzw
 
-        if np.linalg.norm(rot_xyzw) < 1e-6:
+        norm = np.linalg.norm(rot_xyzw)
+        if norm < 1e-4:
             continue  # No tracking data yet for this joint
+        rot_xyzw /= norm  # Normalize before scipy to avoid zero-norm errors
 
         if reference is not None and name in reference:
+            ref_q = reference[name]
+            ref_norm = np.linalg.norm(ref_q)
+            if ref_norm < 1e-4:
+                continue
+            ref_q = ref_q / ref_norm
             cur = R.from_quat(rot_xyzw)
-            ref = R.from_quat(reference[name])
+            ref = R.from_quat(ref_q)
             rot_xyzw = (cur * ref.inv()).as_quat()
 
         bones[name] = {"head": pos, "rot": tuple(rot_xyzw)}
@@ -98,9 +106,10 @@ def _iobt_capture_reference(
     for idx, name in IOBT_TO_BONE.items():
         pose = body[idx]
         quat = np.array([pose[4], pose[5], pose[6], pose[3]])
-        if np.linalg.norm(quat) < 1e-6:
+        norm = np.linalg.norm(quat)
+        if norm < 1e-4:
             continue  # No tracking data for this joint
-        ref[name] = quat
+        ref[name] = quat / norm
     return ref
 
 
@@ -122,16 +131,23 @@ ALIAS_MAP: Dict[str, List[str]] = {
     "right_hand": ["right_hand", "right_wrist"],
 }
 
-# qpos index -> WBC joint name (8 arm joints only)
+# qpos index -> WBC joint name (shoulder + elbow + wrist_roll per arm).
+# Wrist rolls are passthrough: the WBC policy does not command them, so PCF
+# takes the GMR-retargeted value and sends it straight to the actuator.
+# Prototype caveat: PCF has no "owner" concept per joint. If a future policy
+# starts writing wrist_roll, its output and the GMR passthrough will race on
+# the same zenoh command and last-write-wins. Revisit then.
 ARM_JOINT_INDICES: Dict[str, int] = {
     "left_shoulder_pitch": 24,
     "left_shoulder_roll": 25,
     "left_shoulder_yaw": 26,
     "left_elbow_pitch": 27,
+    "left_wrist_roll": 28,
     "right_shoulder_pitch": 29,
     "right_shoulder_roll": 30,
     "right_shoulder_yaw": 31,
     "right_elbow_pitch": 32,
+    "right_wrist_roll": 33,
 }
 
 # MuJoCo body names for torso angle computation
@@ -241,43 +257,149 @@ def compute_torso_angle(
     pelvis_id: int,
     chest_id: int,
 ) -> Tuple[float, float, float]:
-    """Compute torso roll/pitch/yaw.
+    """Compute chest roll/pitch/yaw in world frame.
 
-    Roll and pitch are chest orientation relative to the control frame
-    (z-up, yaw-aligned to pelvis heading). Yaw is the pelvis heading
-    in world frame.
+    All three angles are the chest body orientation in the world frame,
+    decomposed as ZYX intrinsic Euler angles (yaw, pitch, roll).
     """
-    # Body quaternions from MuJoCo (wxyz format) — copy to avoid aliasing
-    pelvis_q = np.array(data.xquat[pelvis_id], dtype=float)
     chest_q = np.array(data.xquat[chest_id], dtype=float)
 
-    # Normalize (guard against zero/degenerate quaternions)
-    pn = np.linalg.norm(pelvis_q)
     cn = np.linalg.norm(chest_q)
-    if not np.isfinite(pn) or not np.isfinite(cn) or pn < 1e-6 or cn < 1e-6:
+    if not np.isfinite(cn) or cn < 1e-6:
         return 0.0, 0.0, 0.0
-    pelvis_q /= pn
     chest_q /= cn
 
     # Convert wxyz → xyzw for scipy
-    pelvis_xyzw = np.array([pelvis_q[1], pelvis_q[2], pelvis_q[3], pelvis_q[0]])
     chest_xyzw = np.array([chest_q[1], chest_q[2], chest_q[3], chest_q[0]])
-    if np.linalg.norm(pelvis_xyzw) < 1e-6 or np.linalg.norm(chest_xyzw) < 1e-6:
-        return 0.0, 0.0, 0.0
-    pelvis_rot = R.from_quat(pelvis_xyzw)
     chest_rot = R.from_quat(chest_xyzw)
 
-    # Pelvis yaw in world frame
-    world_yaw = pelvis_rot.as_euler("ZYX")[0]
+    # ZYX intrinsic: first yaw around Z, then pitch around Y, then roll around X
+    yaw, pitch, roll = chest_rot.as_euler("ZYX")
 
-    # Chest relative to control frame (z-up, yaw-aligned to pelvis)
-    control_rot = R.from_euler("Z", world_yaw)
-    relative_rot = control_rot.inv() * chest_rot
+    return float(roll), float(pitch), float(yaw)
 
-    # Roll/pitch from relative rotation, yaw from pelvis world heading
-    roll, pitch, _ = relative_rot.as_euler("xyz")
 
-    return float(roll), float(pitch), float(world_yaw)
+# Neck joint limits from iteration_1 MJCF (radians). Clamp commands to
+# these so the neck never chases a target past its hardware stops.
+NECK_PITCH_LIMIT = (-0.645772, 0.820305)
+NECK_YAW_LIMIT = (-2.56563, 2.56563)
+
+# Slew-rate caps for direct-commanded joints (neck + wrist rolls). These
+# joints bypass the policy, so a new target (Reset View, mode switch,
+# operator snapping their wrist) can be arbitrarily far from where the
+# joint currently is, and sending it directly snaps the actuator. We
+# clamp the commanded delta per second instead and let it ramp.
+NECK_MAX_RATE_RAD_S = 5.0
+WRIST_MAX_RATE_RAD_S = 5.0
+# If the loop stalls (e.g. PCF RPC timeout), cap the effective dt so we
+# don't let a burst-step through that is dt * rate large.
+RATE_LIMIT_MAX_DT_S = 0.1
+JOINT_MAX_RATE_RAD_S: Dict[str, float] = {
+    "neck_pitch": NECK_MAX_RATE_RAD_S,
+    "neck_yaw": NECK_MAX_RATE_RAD_S,
+    "left_wrist_roll": WRIST_MAX_RATE_RAD_S,
+    "right_wrist_roll": WRIST_MAX_RATE_RAD_S,
+}
+
+
+def apply_rate_limit(
+    targets: Dict[str, float],
+    last_commanded: Dict[str, float],
+    dt_s: float,
+) -> Dict[str, float]:
+    """Return a copy of `targets` with rate-limited values for any joint in
+    JOINT_MAX_RATE_RAD_S. `last_commanded` is the per-joint slew state;
+    it is updated in place so the next call continues from where this one
+    left off. Joints that do not appear in `targets` are skipped. First-
+    time targets seed from 0 rad (home pose), so the operator-home flow
+    ramps up smoothly rather than snapping from 0 to operator pose.
+    """
+    limited = dict(targets)
+    for name, max_rate in JOINT_MAX_RATE_RAD_S.items():
+        if name not in limited:
+            continue
+        target = limited[name]
+        prev = last_commanded.get(name, 0.0)
+        max_step = max_rate * dt_s
+        delta = target - prev
+        if abs(delta) > max_step:
+            new_cmd = prev + math.copysign(max_step, delta)
+        else:
+            new_cmd = target
+        limited[name] = new_cmd
+        last_commanded[name] = new_cmd
+    return limited
+
+
+def compute_neck_angles_from_headset(
+    head_pose_xr: Optional[Tuple[float, ...]],
+    torso_pitch_world: float,
+    torso_yaw_world: float,
+) -> Optional[Tuple[float, float]]:
+    """Headset-driven neck targets that stabilize the robot's head to the
+    ground. Returns (neck_pitch_cmd, neck_yaw_cmd) in robot joint convention.
+
+    Input is an OpenXR VIEW-in-LOCAL head pose (x, y, z, qw, qx, qy, qz)
+    from snap.head. OpenXR frame: +X=right, +Y=up, -Z=forward, right-handed.
+    Robot joint convention (iteration_1 MJCF): +neck_pitch rotates head
+    down, +neck_yaw rotates head left.
+
+    torso_pitch_world / torso_yaw_world: the pitch and yaw we are about
+    to command via `controller.torso_angle(...)`, in the robot's world
+    frame (both already in robot sign, +pitch=forward, +yaw=left). Must
+    be the final commanded values, including PITCH_OFFSET and any
+    retargeting output, so the neck cancels whatever the torso actually
+    does.
+
+    Stabilization logic: robot_head_world = robot_torso_world + neck. We
+    want robot_head_world to match the operator's head orientation in
+    world, so neck = operator_head_world - commanded_torso. Effect: when
+    the operator bends forward but keeps the head level, the neck pitches
+    back to keep the robot's head parallel to the floor. Neck is clipped
+    to MJCF joint limits; big body tilts may hit the clip and leak back
+    into the head.
+
+    Chest is deliberately NOT used as a reference here: the IOBT chest
+    joint frame is rotated ~90° around up relative to the headset VIEW
+    frame, so a direct `chest.inv() * head` injects a 90° bias at rest
+    and flips yaw. Working in world and subtracting the commanded torso
+    sidesteps that.
+    """
+    if head_pose_xr is None:
+        return None
+    head_quat_xyzw = np.array(
+        [head_pose_xr[4], head_pose_xr[5], head_pose_xr[6], head_pose_xr[3]],
+        dtype=float,
+    )
+    head_norm = np.linalg.norm(head_quat_xyzw)
+    if head_norm < 1e-4:
+        return None
+    head_rot_xr = R.from_quat(head_quat_xyzw / head_norm)
+    head_forward_in_xr_world = head_rot_xr.apply(np.array([0.0, 0.0, -1.0]))
+    fwd_x, fwd_y, fwd_z = head_forward_in_xr_world
+    # Operator yaw: swing of forward vector around world +Y (up). Forward
+    # nominally sits near -Z; a positive operator_yaw_xr (head turning
+    # right, so forward tilts toward world +X) is atan2(+X, -(-Z)).
+    operator_yaw_xr = math.atan2(fwd_x, -fwd_z)
+    # Operator pitch: elevation of forward vector off the world horizontal.
+    # Positive = looking up (forward tilts toward world +Y).
+    operator_pitch_xr = math.atan2(
+        fwd_y, math.sqrt(fwd_x * fwd_x + fwd_z * fwd_z)
+    )
+    # Flip to robot joint sign (robot: +pitch=down, +yaw=left).
+    head_target_pitch_world = -operator_pitch_xr
+    head_target_yaw_world = -operator_yaw_xr
+    # Cancel whatever the torso is about to do, so the head lands at the
+    # operator's world orientation regardless of body pose.
+    neck_pitch_cmd = float(np.clip(
+        head_target_pitch_world - torso_pitch_world,
+        NECK_PITCH_LIMIT[0], NECK_PITCH_LIMIT[1],
+    ))
+    neck_yaw_cmd = float(np.clip(
+        head_target_yaw_world - torso_yaw_world,
+        NECK_YAW_LIMIT[0], NECK_YAW_LIMIT[1],
+    ))
+    return neck_pitch_cmd, neck_yaw_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +417,8 @@ def main() -> None:
     parser.add_argument("--robot", type=str, default="persona_it1")
     parser.add_argument("--port", type=int, default=4202,
                         help="Zenoh TCP port for pcf")
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Host/IP where pcf is running")
     parser.add_argument("--teleop-port", type=int, default=9876,
                         help="UDP port for teleop_rs Quest 3 data")
     parser.add_argument("--viewer", action="store_true",
@@ -352,10 +476,9 @@ def main() -> None:
     chest_id = _body_id(model, CHEST_BODY)
 
     # --- WBC controller ---
-    controller = ControllerApi(args.port)
-    print(f"[solarxr_wbc] Connected to pcf on port {args.port}")
-    print("[solarxr_wbc] Starting walk policy...")
-    controller.policy("walk")
+    controller = ControllerApi(args.port, args.host)
+    print(f"[solarxr_wbc] Connected to pcf at {args.host}:{args.port}")
+    print("[solarxr_wbc] Idle — press B on right controller to arm + home.")
 
     # --- Optional viewer ---
     viewer = None
@@ -366,15 +489,26 @@ def main() -> None:
     LATERAL_MAX = 0.5  # m/s
     ANGULAR_MAX = 1.5  # rad/s
     JOYSTICK_DEADZONE = 0.1
-    mode = "walk"  # current policy: "wbc" or "walk"
-    a_button_prev = False
+    armed = False  # True after first B press
+    mode: Optional[str] = None  # None=idle, "walk", or "wbc"
+    # None = haven't seen a valid controller frame yet. The first frame seeds
+    # prev state without firing edges, so buttons already held when the script
+    # starts (e.g. Quest app was running before us) don't look like presses.
+    a_button_prev: Optional[bool] = None
+    b_button_prev: Optional[bool] = None
+    r_trigger_prev: Optional[bool] = None
+    recenter_prev = False
     last_missing_report = 0.0
+    last_wrist_debug = 0.0  # throttled wrist-roll command print (~2 Hz)
     iobt_debug_frames = 3  # print first 3 frames when --verbose --iobt
     iobt_reference: Optional[Dict[str, np.ndarray]] = None
+    # Slew-rate state for direct-commanded joints (see apply_rate_limit).
+    last_commanded: Dict[str, float] = {}
+    rate_limit_last_t: Optional[float] = None
 
     if args.iobt:
         print("[solarxr_wbc] Stand in neutral pose (arms down), then press Reset View on Quest 3.")
-    print("[solarxr_wbc] A=toggle WBC/walk, Reset View=reset SlimeVR. Ctrl-C to stop.")
+    print("[solarxr_wbc] B=home (arm), A=start walk / toggle WBC<->walk, R-trigger=stop, Reset View=recenter. Ctrl-C to exit.")
 
     try:
         while True:
@@ -399,33 +533,70 @@ def main() -> None:
                         c.position, (-qx, qy, -qz, qw)
                     )
 
-            # --- A button: toggle WBC <-> walk ---
-            a_button = (
-                snap.controller_right.buttons[0]
-                if snap.controller_right
-                else False
-            )
-            if a_button and not a_button_prev:
-                if mode == "wbc":
-                    mode = "walk"
-                    print("[solarxr_wbc] Switching to WALK policy")
-                    controller.policy("walk")
-                else:
-                    mode = "wbc"
-                    print("[solarxr_wbc] Switching to WBC policy")
-                    controller.policy("wbc")
-            a_button_prev = a_button
+            # --- Right controller: B=arm+home, A=start walk / toggle WBC<->walk, trigger=stop ---
+            # Only process when we actually have controller data; otherwise prev state
+            # stays frozen so the next valid frame doesn't look like a rising edge.
+            if snap.controller_right is not None:
+                a_button = snap.controller_right.buttons[0]
+                b_button = snap.controller_right.buttons[1]
+                r_trigger = snap.controller_right.trigger > 0.5
 
-            # --- Recenter / calibrate ---
-            if snap.recenter:
-                if args.iobt and snap.upper_body:
+                if (
+                    a_button_prev is None
+                    or b_button_prev is None
+                    or r_trigger_prev is None
+                ):
+                    # First valid frame: seed baselines, no edges fire.
+                    a_button_prev = a_button
+                    b_button_prev = b_button
+                    r_trigger_prev = r_trigger
+                else:
+                    if b_button and not b_button_prev:
+                        armed = True
+                        print("[solarxr_wbc] B pressed — homing.")
+                        controller.pose("home")
+                    if a_button and not a_button_prev and armed:
+                        if mode is None:
+                            mode = "walk"
+                            print("[solarxr_wbc] A pressed — starting WALK policy")
+                            controller.policy("walk")
+                        elif mode == "walk":
+                            mode = "wbc"
+                            print("[solarxr_wbc] Switching to WBC policy")
+                            controller.policy("wbc_1")
+                        else:
+                            mode = "walk"
+                            print("[solarxr_wbc] Switching to WALK policy")
+                            controller.policy("walk")
+                    if r_trigger and not r_trigger_prev:
+                        print("[solarxr_wbc] Right trigger pulled — stopping policy, returning to idle.")
+                        controller.stop()
+                        mode = None
+                        armed = False
+
+                    a_button_prev = a_button
+                    b_button_prev = b_button
+                    r_trigger_prev = r_trigger
+
+            # --- Recenter / calibrate (edge-detected: upstream may send sticky True) ---
+            # Posture calibration (IOBT neutral pose) runs once per script run,
+            # on the first Reset View. Subsequent presses only update the local
+            # XR frame so the operator can re-center without re-standing the
+            # pose.
+            if snap.recenter and not recenter_prev:
+                if args.iobt and snap.upper_body and iobt_reference is None:
                     iobt_reference = _iobt_capture_reference(snap.upper_body)
                     iobt_debug_frames = 3
                     print("[iobt] Neutral pose captured — calibration done.")
                 if client is not None:
                     print("[solarxr_wbc] Resetting SlimeVR skeleton (recenter)")
                     client.reset_full()
+            recenter_prev = snap.recenter
 
+            # --- Idle: no policy active yet, just watch buttons ---
+            if mode is None:
+                time.sleep(0.02)
+                continue
 
             # --- Walk mode: joystick control ---
             if mode == "walk":
@@ -455,6 +626,30 @@ def main() -> None:
                     lateral=-lx * LATERAL_MAX,
                     angular=-rx * ANGULAR_MAX,
                 )
+
+                # Neck tracking during walking: walk policy controls the torso,
+                # so we don't know its exact pose here. Passing zero torso
+                # means the walking policy's built-in lean shows up as a
+                # small constant pitch bias on the head; acceptable for now.
+                neck_walk = compute_neck_angles_from_headset(
+                    snap.head,
+                    torso_pitch_world=0.0,
+                    torso_yaw_world=0.0,
+                )
+                if neck_walk is not None:
+                    now_ts = time.time()
+                    dt_s = (
+                        0.02 if rate_limit_last_t is None
+                        else min(RATE_LIMIT_MAX_DT_S, now_ts - rate_limit_last_t)
+                    )
+                    rate_limit_last_t = now_ts
+                    neck_targets = apply_rate_limit(
+                        {"neck_pitch": neck_walk[0], "neck_yaw": neck_walk[1]},
+                        last_commanded,
+                        dt_s,
+                    )
+                    controller.joint_states(neck_targets)
+
                 time.sleep(0.02)
                 continue
 
@@ -499,16 +694,46 @@ def main() -> None:
             arm_targets = {
                 name: float(qpos[idx]) for name, idx in ARM_JOINT_INDICES.items()
             }
+
+            # --- Torso angle (computed first so the neck can cancel its effect) ---
+            roll, pitch, yaw = compute_torso_angle(
+                model, mj_data, pelvis_id, chest_id
+            )
+
+            # --- Neck from headset, stabilized to world (head parallel to ground) ---
+            neck = compute_neck_angles_from_headset(
+                snap.head,
+                torso_pitch_world=pitch,
+                torso_yaw_world=yaw,
+            )
+            if neck is not None:
+                arm_targets["neck_pitch"], arm_targets["neck_yaw"] = neck
+
+            # --- Rate-limit direct-commanded joints (neck + wrist rolls) ---
+            now_ts = time.time()
+            dt_s = (
+                0.02 if rate_limit_last_t is None
+                else min(RATE_LIMIT_MAX_DT_S, now_ts - rate_limit_last_t)
+            )
+            rate_limit_last_t = now_ts
+            arm_targets = apply_rate_limit(arm_targets, last_commanded, dt_s)
+
             controller.joint_states(arm_targets)
+
+            # --- Wrist-roll debug print (throttled) ---
+            now = time.time()
+            if now - last_wrist_debug > 0.5:
+                last_wrist_debug = now
+                print(
+                    f"[wrist_roll] left={arm_targets['left_wrist_roll']:+.3f} "
+                    f"right={arm_targets['right_wrist_roll']:+.3f} rad"
+                )
 
             # --- Extract height ---
             height = float(qpos[HEIGHT_INDEX])
             controller.height(height)
 
-            # --- Compute and send torso angle ---
-            roll, pitch, yaw = compute_torso_angle(
-                model, mj_data, pelvis_id, chest_id
-            )
+            # --- Send torso angle ---
             controller.torso_angle(roll=roll, pitch=pitch, yaw=yaw)
 
             # --- Optional viewer ---
@@ -523,9 +748,8 @@ def main() -> None:
 
 
     except KeyboardInterrupt:
-        print("\n[solarxr_wbc] Stopping...")
+        print("\n[solarxr_wbc] Stopping (policy persists on robot)...")
     finally:
-        controller.stop()
         if viewer is not None:
             viewer.close()
         if client is not None:
