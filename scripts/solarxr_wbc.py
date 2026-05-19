@@ -155,6 +155,7 @@ PELVIS_BODY = "pelvis_link"
 CHEST_BODY = "spine_pitch_link"
 
 HEIGHT_INDEX = 2  # qpos[2] = pelvis Z
+DEFAULT_STANDING_HEIGHT = 0.773  # IT1 pelvis Z in home pose (from MuJoCo scene)
 
 
 def _resolve_solarxr_path(user_path: Optional[str]) -> Path:
@@ -428,10 +429,10 @@ def main() -> None:
                         help="Use Quest 3 IOBT body tracking directly (skip SolarXR/SlimeVR)")
     args = parser.parse_args()
 
-    # --- Import ControllerApi from pcf ---
-    pcf_scripts = Path(__file__).resolve().parents[1].parent / "persona" / "locomotion" / "pcf" / "scripts"
-    sys.path.insert(0, str(pcf_scripts))
-    from utils.controller import ControllerApi  # type: ignore
+    # --- Import ControllerApi from persona repo ---
+    persona_root = Path(__file__).resolve().parents[1].parent / "persona"
+    sys.path.insert(0, str(persona_root))
+    from locomotion.pcf_client_py.controller_api import ControllerApi
 
     # --- Teleop receiver (always needed for head/controllers) ---
     from teleop_receiver import TeleopReceiver
@@ -510,6 +511,8 @@ def main() -> None:
         print("[solarxr_wbc] Stand in neutral pose (arms down), then press Reset View on Quest 3.")
     print("[solarxr_wbc] B=home (arm), A=start walk / toggle WBC<->walk, R-trigger=stop, Reset View=recenter. Ctrl-C to exit.")
 
+    ctrl_ready = False
+
     try:
         while True:
             snap = teleop.latest()
@@ -541,12 +544,10 @@ def main() -> None:
                 b_button = snap.controller_right.buttons[1]
                 r_trigger = snap.controller_right.trigger > 0.5
 
-                if (
-                    a_button_prev is None
-                    or b_button_prev is None
-                    or r_trigger_prev is None
-                ):
-                    # First valid frame: seed baselines, no edges fire.
+                if not ctrl_ready:
+                    if not a_button and not b_button and not r_trigger:
+                        ctrl_ready = True
+                        print("[solarxr_wbc] Controllers ready.")
                     a_button_prev = a_button
                     b_button_prev = b_button
                     r_trigger_prev = r_trigger
@@ -559,16 +560,20 @@ def main() -> None:
                         if mode is None:
                             mode = "walk"
                             print("[solarxr_wbc] A pressed — starting WALK policy")
+                            controller.height(DEFAULT_STANDING_HEIGHT)
                             controller.policy("walk")
                         elif mode == "walk":
                             mode = "wbc"
                             print("[solarxr_wbc] Switching to WBC policy")
-                            controller.policy("wbc_1")
+                            last_commanded.clear()
+                            retarget.setup_retarget_configuration()
+                            controller.policy("wbc")
                         else:
                             mode = "walk"
                             print("[solarxr_wbc] Switching to WALK policy")
+                            controller.height(DEFAULT_STANDING_HEIGHT)
                             controller.policy("walk")
-                    if r_trigger and not r_trigger_prev:
+                    if r_trigger and not r_trigger_prev and mode is not None:
                         print("[solarxr_wbc] Right trigger pulled — stopping policy, returning to idle.")
                         controller.stop()
                         mode = None

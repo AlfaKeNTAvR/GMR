@@ -786,11 +786,15 @@ name = "persona-proto"
 version = "0.1.0"
 source = { directory = "../persona/interfaces/persona_proto_py" }
 dependencies = [
+    { name = "numpy" },
     { name = "protobuf" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "protobuf" }]
+requires-dist = [
+    { name = "numpy" },
+    { name = "protobuf" },
+]
 
 [[package]]
 name = "pillow"
