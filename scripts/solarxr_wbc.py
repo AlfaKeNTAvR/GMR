@@ -80,14 +80,14 @@ def _iobt_to_bones(
         rot_xyzw = np.array([pose[4], pose[5], pose[6], pose[3]])  # wxyz → xyzw
 
         norm = np.linalg.norm(rot_xyzw)
-        if norm < 1e-4:
-            continue  # No tracking data yet for this joint
-        rot_xyzw /= norm  # Normalize before scipy to avoid zero-norm errors
+        if norm < 1e-4 or not np.isfinite(norm):
+            continue
+        rot_xyzw /= norm
 
         if reference is not None and name in reference:
             ref_q = reference[name]
             ref_norm = np.linalg.norm(ref_q)
-            if ref_norm < 1e-4:
+            if ref_norm < 1e-4 or not np.isfinite(ref_norm):
                 continue
             ref_q = ref_q / ref_norm
             cur = R.from_quat(rot_xyzw)
