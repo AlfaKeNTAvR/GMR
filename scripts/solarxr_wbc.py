@@ -98,6 +98,9 @@ def _iobt_to_bones(
     return bones
 
 
+IOBT_CALIBRATION_FILE = Path(__file__).resolve().parent / ".iobt_calibration.npz"
+
+
 def _iobt_capture_reference(
     body: List[Tuple[float, ...]],
 ) -> Dict[str, np.ndarray]:
@@ -108,9 +111,18 @@ def _iobt_capture_reference(
         quat = np.array([pose[4], pose[5], pose[6], pose[3]])
         norm = np.linalg.norm(quat)
         if norm < 1e-4:
-            continue  # No tracking data for this joint
+            continue
         ref[name] = quat / norm
+    np.savez(IOBT_CALIBRATION_FILE, **ref)
     return ref
+
+
+def _iobt_load_reference() -> Optional[Dict[str, np.ndarray]]:
+    """Load a previously saved IOBT calibration if it exists."""
+    if not IOBT_CALIBRATION_FILE.exists():
+        return None
+    data = np.load(IOBT_CALIBRATION_FILE)
+    return {name: data[name] for name in data.files}
 
 
 ALIAS_MAP: Dict[str, List[str]] = {
@@ -427,6 +439,8 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--iobt", action="store_true",
                         help="Use Quest 3 IOBT body tracking directly (skip SolarXR/SlimeVR)")
+    parser.add_argument("--recalibrate", action="store_true",
+                        help="Force new neutral-pose calibration (default: reuse saved calibration)")
     args = parser.parse_args()
 
     # --- Import ControllerApi from persona repo ---
@@ -503,11 +517,15 @@ def main() -> None:
     last_wrist_debug = 0.0  # throttled wrist-roll command print (~2 Hz)
     iobt_debug_frames = 3  # print first 3 frames when --verbose --iobt
     iobt_reference: Optional[Dict[str, np.ndarray]] = None
+    if args.iobt and not args.recalibrate:
+        iobt_reference = _iobt_load_reference()
+        if iobt_reference is not None:
+            print(f"[iobt] Loaded saved calibration ({len(iobt_reference)} joints).")
     # Slew-rate state for direct-commanded joints (see apply_rate_limit).
     last_commanded: Dict[str, float] = {}
     rate_limit_last_t: Optional[float] = None
 
-    if args.iobt:
+    if args.iobt and iobt_reference is None:
         print("[solarxr_wbc] Stand in neutral pose (arms down), then press Reset View on Quest 3.")
     print("[solarxr_wbc] B=home (arm), A=start walk / toggle WBC<->walk, R-trigger=stop, Reset View=recenter. Ctrl-C to exit.")
 
